@@ -48,7 +48,21 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
     const { results } = await db.prepare(
       'SELECT id, sender, subject, received_at, is_read, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT ?'
     ).bind(mailboxId, limit).all();
-    return Response.json(results || []);
+    // 兼容标准邮箱API格式，添加 from/text/body 字段
+    const mapped = (results || []).map(r => ({
+      id: r.id,
+      from: r.sender,
+      sender: r.sender,
+      subject: r.subject,
+      date: r.received_at,
+      received_at: r.received_at,
+      is_read: r.is_read,
+      text: r.preview || (r.verification_code ? `Your verification code is: ${r.verification_code}` : ''),
+      body: r.preview || '',
+      preview: r.preview,
+      verification_code: r.verification_code
+    }));
+    return Response.json(mapped);
   }
 
   const isMailboxOnly = !!options.mailboxOnly;
