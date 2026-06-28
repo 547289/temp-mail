@@ -271,13 +271,22 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
     if (xToken && xToken === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
+    // 支持URL参数传递token
+    const url = new URL(request.url);
+    const urlToken = url.searchParams.get('token') || '';
+    if (urlToken && urlToken === JWT_TOKEN) {
+      return { role: 'admin', username: '__root__', userId: 0 };
+    }
+    // 支持Authorization头不带Bearer前缀
+    if (auth && !auth.startsWith('Bearer ') && auth === JWT_TOKEN) {
+      return { role: 'admin', username: '__root__', userId: 0 };
+    }
     return null;
   } catch (err) {
     void err;
     return null;
   }
 }
-
 /**
  * 解析请求的认证负载信息（导出给server.js使用）
  * @param {Request} request - HTTP请求对象
