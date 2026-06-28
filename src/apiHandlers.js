@@ -37,6 +37,20 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
   const logId = logger.generateLogId ? logger.generateLogId() : `api-${Date.now()}`;
   const url = new URL(request.url);
   const path = url.pathname;
+
+  // 兼容 /api/mailbox/{email}/messages 路径格式
+  const mailboxMsgMatch = path.match(/^\/api\/mailbox\/([^/]+)\/messages$/);
+  if (mailboxMsgMatch && request.method === 'GET') {
+    const mailboxAddr = decodeURIComponent(mailboxMsgMatch[1]).trim().toLowerCase();
+    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 50);
+    const mailboxId = await getMailboxIdByAddress(db, mailboxAddr);
+    if (!mailboxId) return Response.json([]);
+    const { results } = await db.prepare(
+      'SELECT id, sender, subject, received_at, is_read, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT ?'
+    ).bind(mailboxId, limit).all();
+    return Response.json(results || []);
+  }
+
   const isMailboxOnly = !!options.mailboxOnly;
   const RESEND_API_KEY = options.resendApiKey || '';
 
