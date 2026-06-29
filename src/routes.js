@@ -520,19 +520,14 @@ export function createRouter() {
     });
   });
 
-  // =================== 外部API接口（token查询参数认证） ===================
+  // =================== 外部API接口（支持请求头/查询参数token认证） ===================
   
-  // 获取邮箱最新验证码（纯文本返回，供外部EXE/脚本调用）
+  // 获取邮箱最新验证码（长轮询模式，供外部EXE/脚本调用）
+  // 如果验证码未到达，服务端会持续等待最多45秒，每3秒查询一次
+  // 认证已由authMiddleware处理（支持Authorization头/X-Admin-Token头/query参数token）
   router.get('/api/mailbox/:email/code', async(context) => {
     const { env, query, params } = context;
     const logId = `extapi-${Date.now()}`;
-    
-    // token认证：支持query参数token
-    const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
-    const queryToken = query.token || '';
-    if (!JWT_TOKEN || queryToken !== JWT_TOKEN) {
-      return new Response('Unauthorized', { status: 401 });
-    }
     
     let DB;
     try {
@@ -547,42 +542,54 @@ export function createRouter() {
       return new Response('', { status: 400 });
     }
     
+    // 长轮询参数：timeout秒数（默认45秒，最大55秒）
+    const timeout = Math.min(parseInt(query.timeout || '45', 10), 55) * 1000;
+    const interval = 3000; // 每3秒查询一次
+    const startTime = Date.now();
+    
     try {
-      // 查找邮箱ID
-      const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
-      if (!mailbox) {
-        return new Response('', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      while (true) {
+        // 查找邮箱ID
+        const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
+        
+        if (mailbox) {
+          // 获取最新一封有验证码的邮件
+          const msg = await DB.prepare(
+            'SELECT verification_code FROM messages WHERE mailbox_id = ? AND verification_code IS NOT NULL AND verification_code != \'\' ORDER BY received_at DESC LIMIT 1'
+          ).bind(mailbox.id).first();
+          
+          if (msg?.verification_code) {
+            logger.info('外部API获取验证码成功', { logId, email, code: msg.verification_code, waitMs: Date.now() - startTime });
+            return new Response(msg.verification_code, {
+              status: 200,
+              headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+            });
+          }
+        }
+        
+        // 检查是否超时
+        if (Date.now() - startTime >= timeout) {
+          logger.info('外部API获取验证码超时', { logId, email, waitMs: Date.now() - startTime });
+          return new Response('', {
+            status: 200,
+            headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+        
+        // 等待3秒后重试
+        await new Promise(resolve => setTimeout(resolve, interval));
       }
-      
-      // 获取最新一封有验证码的邮件
-      const msg = await DB.prepare(
-        'SELECT verification_code FROM messages WHERE mailbox_id = ? AND verification_code IS NOT NULL AND verification_code != \'\'  ORDER BY received_at DESC LIMIT 1'
-      ).bind(mailbox.id).first();
-      
-      const code = msg?.verification_code || '';
-      logger.info('外部API获取验证码', { logId, email, hasCode: !!code });
-      
-      return new Response(code, {
-        status: 200,
-        headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
-      });
     } catch (e) {
       logger.error('外部API查询失败', { logId, email, error: e.message });
       return new Response('', { status: 500 });
     }
   });
 
-  // 获取邮箱邮件列表（JSON数组返回，供外部调用）
+  // 获取邮箱邮件列表（JSON数组返回，供外部调用，长轮询模式）
+  // 认证已由authMiddleware处理
   router.get('/api/mailbox/:email/messages', async(context) => {
     const { env, query, params } = context;
     const logId = `extapi-${Date.now()}`;
-    
-    // token认证
-    const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
-    const queryToken = query.token || '';
-    if (!JWT_TOKEN || queryToken !== JWT_TOKEN) {
-      return new Response('Unauthorized', { status: 401 });
-    }
     
     let DB;
     try {
@@ -597,22 +604,42 @@ export function createRouter() {
       return new Response('[]', { status: 400, headers: { 'Content-Type': 'application/json' } });
     }
     
+    // 长轮询参数：timeout秒数（默认45秒，最大55秒）
+    const timeout = Math.min(parseInt(query.timeout || '45', 10), 55) * 1000;
+    const interval = 3000; // 每3秒查询一次
+    const startTime = Date.now();
+    
     try {
-      const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
-      if (!mailbox) {
-        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      while (true) {
+        const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
+        
+        if (mailbox) {
+          const { results } = await DB.prepare(
+            'SELECT id, sender AS "from", sender, subject, received_at AS date, received_at, is_read, preview AS text, preview AS body, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT 20'
+          ).bind(mailbox.id).all();
+          
+          // 如果有邮件，立即返回
+          if (results && results.length > 0) {
+            logger.info('外部API获取邮件列表成功', { logId, email, count: results.length, waitMs: Date.now() - startTime });
+            return new Response(JSON.stringify(results), {
+              status: 200,
+              headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+            });
+          }
+        }
+        
+        // 检查是否超时
+        if (Date.now() - startTime >= timeout) {
+          logger.info('外部API获取邮件列表超时', { logId, email, waitMs: Date.now() - startTime });
+          return new Response('[]', {
+            status: 200,
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+          });
+        }
+        
+        // 等待3秒后重试
+        await new Promise(resolve => setTimeout(resolve, interval));
       }
-      
-      const { results } = await DB.prepare(
-        'SELECT id, sender AS "from", sender, subject, received_at AS date, received_at, is_read, preview AS text, preview AS body, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT 20'
-      ).bind(mailbox.id).all();
-      
-      logger.info('外部API获取邮件列表', { logId, email, count: results?.length || 0 });
-      
-      return new Response(JSON.stringify(results || []), {
-        status: 200,
-        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
-      });
     } catch (e) {
       logger.error('外部API查询邮件失败', { logId, email, error: e.message });
       return new Response('[]', { status: 500, headers: { 'Content-Type': 'application/json' } });
