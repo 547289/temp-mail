@@ -271,11 +271,26 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
     }
     const auth = request.headers.get('Authorization') || request.headers.get('authorization') || '';
     const xToken = request.headers.get('X-Admin-Token') || request.headers.get('x-admin-token') || '';
-    const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : '';
+    const apiKey = request.headers.get('X-API-Key') || request.headers.get('x-api-key') || '';
+    const token = request.headers.get('Token') || request.headers.get('token') || '';
+    
+    // 支持多种格式：
+    // 1. Authorization: Bearer <token>
+    // 2. Authorization: <token> (无Bearer前缀)
+    // 3. X-Admin-Token: <token>
+    // 4. X-API-Key: <token>
+    // 5. Token: <token>
+    const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : auth.trim();
     if (bearer && bearer === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
     if (xToken && xToken === JWT_TOKEN) {
+      return { role: 'admin', username: '__root__', userId: 0 };
+    }
+    if (apiKey && apiKey === JWT_TOKEN) {
+      return { role: 'admin', username: '__root__', userId: 0 };
+    }
+    if (token && token === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
     return null;
