@@ -202,6 +202,13 @@ export async function authMiddleware(context) {
     return null;
   }
 
+  // 支持查询参数token认证（供外部EXE/脚本调用）
+  const queryToken = url.searchParams.get('token') || '';
+  if (JWT_TOKEN && queryToken && queryToken === JWT_TOKEN) {
+    context.authPayload = { role: 'admin', username: '__external__', userId: 0 };
+    return null;
+  }
+
   // 验证JWT令牌
   const payload = await verifyJwtWithCache(JWT_TOKEN, request.headers.get('Cookie') || '');
   if (!payload) {
@@ -271,22 +278,13 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
     if (xToken && xToken === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
-    // 支持URL参数传递token
-    const url = new URL(request.url);
-    const urlToken = url.searchParams.get('token') || '';
-    if (urlToken && urlToken === JWT_TOKEN) {
-      return { role: 'admin', username: '__root__', userId: 0 };
-    }
-    // 支持Authorization头不带Bearer前缀
-    if (auth && !auth.startsWith('Bearer ') && auth === JWT_TOKEN) {
-      return { role: 'admin', username: '__root__', userId: 0 };
-    }
     return null;
   } catch (err) {
     void err;
     return null;
   }
 }
+
 /**
  * 解析请求的认证负载信息（导出给server.js使用）
  * @param {Request} request - HTTP请求对象
@@ -520,6 +518,105 @@ export function createRouter() {
       showGuestBanner,
       guestEnabled: guestLoginEnabled
     });
+  });
+
+  // =================== 外部API接口（token查询参数认证） ===================
+  
+  // 获取邮箱最新验证码（纯文本返回，供外部EXE/脚本调用）
+  router.get('/api/mailbox/:email/code', async(context) => {
+    const { env, query, params } = context;
+    const logId = `extapi-${Date.now()}`;
+    
+    // token认证：支持query参数token
+    const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
+    const queryToken = query.token || '';
+    if (!JWT_TOKEN || queryToken !== JWT_TOKEN) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    
+    let DB;
+    try {
+      DB = await getDatabaseWithValidation(env);
+    } catch (error) {
+      logger.error('外部API数据库连接失败', { logId, error: error.message });
+      return new Response('', { status: 500 });
+    }
+    
+    const email = decodeURIComponent(params.email || '').trim().toLowerCase();
+    if (!email) {
+      return new Response('', { status: 400 });
+    }
+    
+    try {
+      // 查找邮箱ID
+      const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
+      if (!mailbox) {
+        return new Response('', { status: 200, headers: { 'Content-Type': 'text/plain' } });
+      }
+      
+      // 获取最新一封有验证码的邮件
+      const msg = await DB.prepare(
+        'SELECT verification_code FROM messages WHERE mailbox_id = ? AND verification_code IS NOT NULL AND verification_code != \'\'  ORDER BY received_at DESC LIMIT 1'
+      ).bind(mailbox.id).first();
+      
+      const code = msg?.verification_code || '';
+      logger.info('外部API获取验证码', { logId, email, hasCode: !!code });
+      
+      return new Response(code, {
+        status: 200,
+        headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+      });
+    } catch (e) {
+      logger.error('外部API查询失败', { logId, email, error: e.message });
+      return new Response('', { status: 500 });
+    }
+  });
+
+  // 获取邮箱邮件列表（JSON数组返回，供外部调用）
+  router.get('/api/mailbox/:email/messages', async(context) => {
+    const { env, query, params } = context;
+    const logId = `extapi-${Date.now()}`;
+    
+    // token认证
+    const JWT_TOKEN = env.JWT_TOKEN || env.JWT_SECRET || '';
+    const queryToken = query.token || '';
+    if (!JWT_TOKEN || queryToken !== JWT_TOKEN) {
+      return new Response('Unauthorized', { status: 401 });
+    }
+    
+    let DB;
+    try {
+      DB = await getDatabaseWithValidation(env);
+    } catch (error) {
+      logger.error('外部API数据库连接失败', { logId, error: error.message });
+      return new Response('[]', { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    const email = decodeURIComponent(params.email || '').trim().toLowerCase();
+    if (!email) {
+      return new Response('[]', { status: 400, headers: { 'Content-Type': 'application/json' } });
+    }
+    
+    try {
+      const mailbox = await DB.prepare('SELECT id FROM mailboxes WHERE address = ? LIMIT 1').bind(email).first();
+      if (!mailbox) {
+        return new Response('[]', { status: 200, headers: { 'Content-Type': 'application/json' } });
+      }
+      
+      const { results } = await DB.prepare(
+        'SELECT id, sender AS "from", sender, subject, received_at AS date, received_at, is_read, preview AS text, preview AS body, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT 20'
+      ).bind(mailbox.id).all();
+      
+      logger.info('外部API获取邮件列表', { logId, email, count: results?.length || 0 });
+      
+      return new Response(JSON.stringify(results || []), {
+        status: 200,
+        headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
+      });
+    } catch (e) {
+      logger.error('外部API查询邮件失败', { logId, email, error: e.message });
+      return new Response('[]', { status: 500, headers: { 'Content-Type': 'application/json' } });
+    }
   });
 
   // =================== API路由委托 ===================
