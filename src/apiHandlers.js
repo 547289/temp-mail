@@ -37,34 +37,6 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
   const logId = logger.generateLogId ? logger.generateLogId() : `api-${Date.now()}`;
   const url = new URL(request.url);
   const path = url.pathname;
-
-  // 兼容 /api/mailbox/{email}/messages 路径格式
-  const mailboxMsgMatch = path.match(/^\/api\/mailbox\/([^/]+)\/messages$/);
-  if (mailboxMsgMatch && request.method === 'GET') {
-    const mailboxAddr = decodeURIComponent(mailboxMsgMatch[1]).trim().toLowerCase();
-    const limit = Math.min(parseInt(url.searchParams.get('limit') || '20', 10), 50);
-    const mailboxId = await getMailboxIdByAddress(db, mailboxAddr);
-    if (!mailboxId) return Response.json([]);
-    const { results } = await db.prepare(
-      'SELECT id, sender, subject, received_at, is_read, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT ?'
-    ).bind(mailboxId, limit).all();
-    // 兼容标准邮箱API格式，添加 from/text/body 字段
-    const mapped = (results || []).map(r => ({
-      id: r.id,
-      from: r.sender,
-      sender: r.sender,
-      subject: r.subject,
-      date: r.received_at,
-      received_at: r.received_at,
-      is_read: r.is_read,
-      text: r.preview || (r.verification_code ? `Your verification code is: ${r.verification_code}` : ''),
-      body: r.preview || '',
-      preview: r.preview,
-      verification_code: r.verification_code
-    }));
-    return Response.json(mapped);
-  }
-
   const isMailboxOnly = !!options.mailboxOnly;
   const RESEND_API_KEY = options.resendApiKey || '';
 
@@ -454,7 +426,7 @@ export async function handleApiRequest(request, db, mailDomains, options = { res
     }
   }
 
-  if (path === '/api/generate') {
+  if (path === '/api/generate' || path === '/api/mailbox') {
     const lengthParam = Number(url.searchParams.get('length') || 0);
     const randomId = generateRandomId(lengthParam || undefined);
     const domains = Array.isArray(mailDomains) ? mailDomains : [(mailDomains || 'temp.example.com')];

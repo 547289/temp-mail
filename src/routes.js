@@ -273,6 +273,7 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
     const xToken = request.headers.get('X-Admin-Token') || request.headers.get('x-admin-token') || '';
     const apiKey = request.headers.get('X-API-Key') || request.headers.get('x-api-key') || '';
     const token = request.headers.get('Token') || request.headers.get('token') || '';
+    const xApiToken = request.headers.get('x-api-token') || request.headers.get('X-Api-Token') || '';
     
     // 支持多种格式：
     // 1. Authorization: Bearer <token>
@@ -280,6 +281,7 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
     // 3. X-Admin-Token: <token>
     // 4. X-API-Key: <token>
     // 5. Token: <token>
+    // 6. x-api-token: <token>（兼容外部注册控制器）
     const bearer = auth.startsWith('Bearer ') ? auth.slice(7).trim() : auth.trim();
     if (bearer && bearer === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
@@ -291,6 +293,9 @@ function checkRootAdminOverride(request, JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
     if (token && token === JWT_TOKEN) {
+      return { role: 'admin', username: '__root__', userId: 0 };
+    }
+    if (xApiToken && xApiToken === JWT_TOKEN) {
       return { role: 'admin', username: '__root__', userId: 0 };
     }
     return null;
@@ -575,9 +580,9 @@ export function createRouter() {
           
           if (msg?.verification_code) {
             logger.info('外部API获取验证码成功', { logId, email, code: msg.verification_code, waitMs: Date.now() - startTime });
-            return new Response(msg.verification_code, {
+            return new Response(JSON.stringify({ success: true, code: msg.verification_code }), {
               status: 200,
-              headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+              headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
             });
           }
         }
@@ -585,9 +590,9 @@ export function createRouter() {
         // 检查是否超时
         if (Date.now() - startTime >= timeout) {
           logger.info('外部API获取验证码超时', { logId, email, waitMs: Date.now() - startTime });
-          return new Response('', {
+          return new Response(JSON.stringify({ success: true, code: '' }), {
             status: 200,
-            headers: { 'Content-Type': 'text/plain', 'Access-Control-Allow-Origin': '*' }
+            headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
           });
         }
         
@@ -601,6 +606,7 @@ export function createRouter() {
   });
 
   // 获取邮箱邮件列表（JSON数组返回，供外部调用，长轮询模式）
+  // 兼容外部注册控制器对接规范：返回 {success, code, data} 包装格式
   // 认证已由authMiddleware处理
   router.get('/api/mailbox/:email/messages', async(context) => {
     const { env, query, params } = context;
@@ -611,12 +617,12 @@ export function createRouter() {
       DB = await getDatabaseWithValidation(env);
     } catch (error) {
       logger.error('外部API数据库连接失败', { logId, error: error.message });
-      return new Response('[]', { status: 500, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ success: false, message: '数据库连接失败' }), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
     
     const email = decodeURIComponent(params.email || '').trim().toLowerCase();
     if (!email) {
-      return new Response('[]', { status: 400, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ success: false, message: '缺少邮箱地址' }), { status: 400, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
     
     // 长轮询参数：timeout秒数（默认45秒，最大55秒）
@@ -630,13 +636,35 @@ export function createRouter() {
         
         if (mailbox) {
           const { results } = await DB.prepare(
-            'SELECT id, sender AS "from", sender, subject, received_at AS date, received_at, is_read, preview AS text, preview AS body, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT 20'
+            'SELECT id, sender, subject, received_at, is_read, preview, verification_code FROM messages WHERE mailbox_id = ? ORDER BY received_at DESC LIMIT 20'
           ).bind(mailbox.id).all();
           
           // 如果有邮件，立即返回
           if (results && results.length > 0) {
-            logger.info('外部API获取邮件列表成功', { logId, email, count: results.length, waitMs: Date.now() - startTime });
-            return new Response(JSON.stringify(results), {
+            // 提取最新验证码
+            const latestCode = results.find(m => m.verification_code)?.verification_code || '';
+            
+            // 转换为对接指南要求的格式
+            const data = results.map(msg => ({
+              id: msg.id,
+              subject: msg.subject || '',
+              text_content: msg.preview || '',
+              html_content: msg.preview ? `<p>${msg.preview}</p>` : '',
+              sender: msg.sender || '',
+              received_at: msg.received_at || '',
+              verification_code: msg.verification_code || ''
+            }));
+            
+            logger.info('外部API获取邮件列表成功', { logId, email, count: results.length, code: latestCode, waitMs: Date.now() - startTime });
+            
+            // 返回兼容两种模式的响应：
+            // code_from_api=true 模式：控制器读取顶层 code 字段
+            // code_from_api=false 模式：控制器读取 data 数组中的 html_content/text_content
+            return new Response(JSON.stringify({
+              success: true,
+              code: latestCode,
+              data: data
+            }), {
               status: 200,
               headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
             });
@@ -646,7 +674,11 @@ export function createRouter() {
         // 检查是否超时
         if (Date.now() - startTime >= timeout) {
           logger.info('外部API获取邮件列表超时', { logId, email, waitMs: Date.now() - startTime });
-          return new Response('[]', {
+          return new Response(JSON.stringify({
+            success: true,
+            code: '',
+            data: []
+          }), {
             status: 200,
             headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }
           });
@@ -657,7 +689,7 @@ export function createRouter() {
       }
     } catch (e) {
       logger.error('外部API查询邮件失败', { logId, email, error: e.message });
-      return new Response('[]', { status: 500, headers: { 'Content-Type': 'application/json' } });
+      return new Response(JSON.stringify({ success: false, message: '查询失败' }), { status: 500, headers: { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' } });
     }
   });
 
